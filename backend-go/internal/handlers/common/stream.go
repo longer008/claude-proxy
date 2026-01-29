@@ -208,12 +208,10 @@ func ProcessStreamEvent(
 				log.Printf("[Messages-Stream-Token] 检测到虚假值, 延迟到流结束修补")
 			}
 		}
-		// 记录 message_start 中的 input_tokens（用于后续推断隐式缓存）
-		// 注意：message_start 的 input_tokens 是请求总 token，不应累积到 CollectedUsage.InputTokens
+		// 对于 message_start 事件，不累积 input_tokens 到 CollectedUsage
+		// 因为 message_start 的 input_tokens 是请求总 token，而非最终计费值
 		// CollectedUsage.InputTokens 应该只记录 message_delta 的最终计费值
-		if IsMessageStartEvent(event) && usageData.InputTokens > 0 && ctx.MessageStartInputTokens == 0 {
-			ctx.MessageStartInputTokens = usageData.InputTokens
-			// 清零 usageData.InputTokens，避免被 updateCollectedUsage 累积
+		if IsMessageStartEvent(event) && usageData.InputTokens > 0 {
 			usageData.InputTokens = 0
 		}
 		// 累积收集 usage 数据
@@ -253,6 +251,14 @@ func ProcessStreamEvent(
 	// 注意：使用 originalUsageData 而非被清零后的 usageData，避免误判
 	if hasUsage {
 		eventToSend = PatchMessageStartInputTokensIfNeeded(eventToSend, requestBody, needInputPatch, originalUsageData, envCfg.EnableResponseLogs && envCfg.ShouldLog("debug"), ctx.LowQuality)
+	}
+
+	// 记录 message_start 中的 input_tokens（用于后续推断隐式缓存）
+	// 注意：必须在 PatchMessageStartInputTokensIfNeeded 之后执行，因为原始值可能是 0 被修补成估算值
+	if IsMessageStartEvent(event) && ctx.MessageStartInputTokens == 0 {
+		if patchedInputTokens := ExtractInputTokensFromEvent(eventToSend); patchedInputTokens > 0 {
+			ctx.MessageStartInputTokens = patchedInputTokens
+		}
 	}
 
 	if ctx.NeedTokenPatch && HasEventWithUsage(event) {
@@ -964,6 +970,39 @@ func IsMessageDeltaEvent(event string) bool {
 		}
 	}
 	return false
+}
+
+// ExtractInputTokensFromEvent 从 SSE 事件中提取 input_tokens
+// 支持 message_start 事件的 message.usage.input_tokens 和顶层 usage.input_tokens
+func ExtractInputTokensFromEvent(event string) int {
+	for _, line := range strings.Split(event, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, "data: ")
+
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue
+		}
+
+		// 检查 message.usage.input_tokens (message_start 事件)
+		if msg, ok := data["message"].(map[string]interface{}); ok {
+			if usage, ok := msg["usage"].(map[string]interface{}); ok {
+				if v, ok := usage["input_tokens"].(float64); ok && v > 0 {
+					return int(v)
+				}
+			}
+		}
+
+		// 检查顶层 usage.input_tokens (message_delta 事件)
+		if usage, ok := data["usage"].(map[string]interface{}); ok {
+			if v, ok := usage["input_tokens"].(float64); ok && v > 0 {
+				return int(v)
+			}
+		}
+	}
+	return 0
 }
 
 // ExtractTextFromEvent 从 SSE 事件中提取文本内容
